@@ -1,18 +1,6 @@
-// main.ino
-// Bow Battery / Thruster Monitor
-// Sensor-only NMEA2000 node:
-//   - INA226 reads 500A shunt + battery voltage
-//   - DS18B20 sensors read battery and thruster temperatures
-//   - Coulomb-counted SOC is tracked/reported where supported
-//   - Onboard Feather NeoPixel shows boot / N2K / warning / error status
-//   - Diagnostic text goes to Serial always, and to N2K when the bus is alive
-//   - No relays, no solenoids, no web UI, no wireless
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
-
-#include "config.h"
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -21,53 +9,72 @@
 #include <NMEA2000_CAN.h>
 #include <N2kMessages.h>
 
-// -----------------------------------------------------------------------------
-// Small INA226 driver. Avoids dependency on a specific INA226 library API.
-// INA226 datasheet constants:
-//   shunt voltage LSB = 2.5 uV
-//   bus voltage LSB   = 1.25 mV
-// -----------------------------------------------------------------------------
+// ================= USER CONFIG =================
+
+#define N2K_OPEN_ENABLED false   // false for bench testing, true on boat
+
+#define ONE_WIRE_PIN 5
+#define STATUS_LED_PIN 8
+
+// Maintenance / verbose logging switch.
+// Wire GPIO to GND through DIP switch.
+// INPUT_PULLUP means:
+//   open = normal quiet mode
+//   closed to GND = verbose maintenance mode
+#define MAINTENANCE_MODE_PIN 12
+
+#define INA226_ADDR 0x40
+
+// 500A / 50mV shunt = 0.0001 ohm
+#define SHUNT_RESISTANCE_OHM 0.0001f
+
+#define BATTERY_CAPACITY_AH 200.0f
+#define INITIAL_SOC_PERCENT 100.0f
+
+#define N2K_BOOT_GRACE_MS 3000
+#define N2K_ACTIVITY_TIMEOUT_MS 3000
+
+#define LED_FAST_FLASH_MS 150
+#define LED_SLOW_FLASH_MS 600
+
+#define SENSOR_READ_INTERVAL_MS 1000
+#define VERBOSE_PRINT_INTERVAL_MS 2000
+
+#define STATUS_LED_BRIGHTNESS 40
+
+// ================= INA226 DRIVER =================
+
 class INA226Simple {
 public:
-  explicit INA226Simple(uint8_t address) : _addr(address) {}
+  INA226Simple(uint8_t addr) : _addr(addr) {}
 
   bool begin() {
     Wire.begin();
 
-    // Config register:
-    // AVG=16 samples, VBUSCT=1.1ms, VSHCT=1.1ms, mode=shunt+bus continuous.
-    writeRegister16(0x00, 0x4527);
+    // AVG=16, VBUSCT=1.1ms, VSHCT=1.1ms, shunt+bus continuous
+    write16(0x00, 0x4527);
     delay(5);
 
-    uint16_t bus = 0;
-    return readRegister16(0x02, bus);
+    uint16_t dummy;
+    return read16(0x02, dummy);
   }
 
-  bool read(float &busVoltageV, float &shuntVoltageMV, float &currentA) {
+  bool read(float &busV, float &shuntMV, float &currentA) {
     uint16_t rawBus = 0;
     uint16_t rawShuntU = 0;
 
-    if (!readRegister16(0x02, rawBus)) return false;
-    if (!readRegister16(0x01, rawShuntU)) return false;
+    if (!read16(0x02, rawBus)) return false;
+    if (!read16(0x01, rawShuntU)) return false;
 
     int16_t rawShunt = (int16_t)rawShuntU;
 
-    busVoltageV = rawBus * 0.00125f;
-    shuntVoltageMV = rawShunt * 0.0025f;
-    currentA = (shuntVoltageMV / 1000.0f) / SHUNT_RESISTANCE_OHM;
+    busV = rawBus * 0.00125f;        // INA226 bus voltage LSB
+    shuntMV = rawShunt * 0.0025f;    // INA226 shunt voltage LSB
 
-#if CURRENT_POSITIVE_IS_CHARGE
-    // Leave sign as-is.
-#else
-    // Invert so positive reported current means charging, negative means discharge.
-    currentA = -currentA;
-#endif
+    currentA = (shuntMV / 1000.0f) / SHUNT_RESISTANCE_OHM;
 
-    currentA += CURRENT_CALIBRATION_OFFSET_A;
-
-    if (fabs(currentA) < CURRENT_ZERO_DEADBAND_A) {
-      currentA = 0.0f;
-    }
+    // Deadband tiny noise
+    if (fabs(currentA) < 0.05f) currentA = 0.0f;
 
     return true;
   }
@@ -75,147 +82,147 @@ public:
 private:
   uint8_t _addr;
 
-  bool writeRegister16(uint8_t reg, uint16_t value) {
+  bool write16(uint8_t reg, uint16_t val) {
     Wire.beginTransmission(_addr);
     Wire.write(reg);
-    Wire.write((uint8_t)(value >> 8));
-    Wire.write((uint8_t)(value & 0xFF));
+    Wire.write((uint8_t)(val >> 8));
+    Wire.write((uint8_t)(val & 0xFF));
     return Wire.endTransmission() == 0;
   }
 
-  bool readRegister16(uint8_t reg, uint16_t &value) {
+  bool read16(uint8_t reg, uint16_t &val) {
     Wire.beginTransmission(_addr);
     Wire.write(reg);
     if (Wire.endTransmission(false) != 0) return false;
 
-    uint8_t n = Wire.requestFrom((int)_addr, 2);
-    if (n != 2) return false;
+    if (Wire.requestFrom((int)_addr, 2) != 2) return false;
 
     uint8_t msb = Wire.read();
     uint8_t lsb = Wire.read();
-    value = ((uint16_t)msb << 8) | lsb;
+    val = ((uint16_t)msb << 8) | lsb;
     return true;
   }
 };
 
-INA226Simple ina226(INA226_I2C_ADDR);
+// ================= GLOBALS =================
+
+INA226Simple ina(INA226_ADDR);
+
 OneWire oneWire(ONE_WIRE_PIN);
-DallasTemperature ds18b20(&oneWire);
-Adafruit_NeoPixel statusPixel(STATUS_NEOPIXEL_COUNT, STATUS_NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+DallasTemperature temps(&oneWire);
 
-struct SensorState {
-  bool inaOk = false;
-  bool battTempOk = false;
-  bool thrustTempOk = false;
+Adafruit_NeoPixel led(1, STATUS_LED_PIN, NEO_GRB + NEO_KHZ800);
 
-  float batteryVoltageV = 0.0f;
-  float shuntVoltageMV = 0.0f;
-  float batteryCurrentA = 0.0f;   // positive = charging, negative = discharging
-  float batteryTempC = NAN;
-  float thrustTempC = NAN;
-
-  float socPercent = INITIAL_SOC_PERCENT;
-  float remainingAh = BATTERY_CAPACITY_AH * (INITIAL_SOC_PERCENT / 100.0f);
+enum SystemState {
+  SYS_BOOTING,
+  SYS_CHECKING,
+  SYS_RUNNING,
+  SYS_FAILED
 };
 
-SensorState state;
+SystemState sysState = SYS_BOOTING;
 
 unsigned long bootMs = 0;
+unsigned long n2kGraceStartMs = 0;
+unsigned long lastCAN = 0;
 unsigned long lastSensorReadMs = 0;
-unsigned long lastN2kSendMs = 0;
-unsigned long lastDiagSendMs = 0;
-unsigned long lastLedUpdateMs = 0;
-unsigned long lastSocUpdateMs = 0;
-unsigned long lastN2kRxMs = 0;
 unsigned long lastVerbosePrintMs = 0;
+unsigned long lastSocUpdateMs = 0;
 
-// Diagnostic edge tracking so repeated text does not spam the bus.
-bool prevInaOk = true;
-bool prevBattTempOk = true;
-bool prevThrustTempOk = true;
-bool prevN2kOk = true;
+bool initialCheckPrinted = false;
 
-// -----------------------------------------------------------------------------
-// Status LED helpers
-// -----------------------------------------------------------------------------
-static void setStatusLed(uint8_t r, uint8_t g, uint8_t b) {
-  statusPixel.setPixelColor(0, statusPixel.Color(r, g, b));
-  statusPixel.show();
+bool inaOk = false;
+bool battTempOk = false;
+bool thrTempOk = false;
+
+float batteryVoltageV = 0.0f;
+float shuntVoltageMV = 0.0f;
+float batteryCurrentA = 0.0f;
+
+float battTempC = NAN;
+float thrTempC = NAN;
+
+float remainingAh = BATTERY_CAPACITY_AH * (INITIAL_SOC_PERCENT / 100.0f);
+float socPercent = INITIAL_SOC_PERCENT;
+
+// ================= LED =================
+
+void setLED(uint8_t r, uint8_t g, uint8_t b) {
+  led.setPixelColor(0, led.Color(r, g, b));
+  led.show();
 }
 
-static void bootLedSequence() {
-  setStatusLed(255, 0, 0);     delay(500);  // red
-  setStatusLed(0, 255, 0);     delay(500);  // green
-  setStatusLed(0, 0, 255);     delay(500);  // blue
-  setStatusLed(255, 255, 255); delay(500);  // white-ish
-  setStatusLed(0, 0, 255);                 // blue while initializing/checking
+void bootSequence() {
+  setLED(255, 0, 0);     delay(500);
+  setLED(0, 255, 0);     delay(500);
+  setLED(0, 0, 255);     delay(500);
+  setLED(255, 255, 255); delay(500);
+  setLED(0, 0, 255);
 }
 
-static bool n2kAlive() {
-  // During boot, stay blue instead of immediately declaring no N2K.
-  if ((millis() - bootMs) < N2K_BOOT_GRACE_MS) return true;
-  return lastN2kRxMs != 0 && ((millis() - lastN2kRxMs) < N2K_ACTIVITY_TIMEOUT_MS);
-}
-
-static bool hardErrorActive() {
-  return !state.inaOk || !n2kAlive();
-}
-
-static bool warningActive() {
-  return !state.battTempOk || !state.thrustTempOk;
-}
-
-static void updateStatusLed() {
+void updateLED() {
+  static bool blink = false;
   static unsigned long lastBlinkMs = 0;
-  static bool blinkOn = false;
+
   unsigned long now = millis();
 
-  if ((now - bootMs) < N2K_BOOT_GRACE_MS && lastN2kRxMs == 0) {
-    setStatusLed(0, 0, 255); // boot grace / waiting for bus traffic
+  // Blue only during boot/check grace
+  if ((now - n2kGraceStartMs) < N2K_BOOT_GRACE_MS) {
+    setLED(0, 0, 255);
     return;
   }
 
-  if (hardErrorActive()) {
+  bool n2kBad = !n2kAlive();
+  bool hardError = n2kBad || !inaOk;
+  bool warning = !battTempOk || !thrTempOk;
+
+  if (hardError) {
     if (now - lastBlinkMs >= LED_FAST_FLASH_MS) {
-      blinkOn = !blinkOn;
+      blink = !blink;
       lastBlinkMs = now;
-      setStatusLed(blinkOn ? 255 : 0, 0, 0);
+      setLED(blink ? 255 : 0, 0, 0);
     }
     return;
   }
 
-  if (warningActive()) {
+  if (warning) {
     if (now - lastBlinkMs >= LED_SLOW_FLASH_MS) {
-      blinkOn = !blinkOn;
+      blink = !blink;
       lastBlinkMs = now;
-      setStatusLed(blinkOn ? 255 : 0, 0, 0);
+      setLED(blink ? 255 : 0, 0, 0);
     }
     return;
   }
 
-  setStatusLed(0, 255, 0); // normal operation
+  setLED(0, 255, 0);
 }
 
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
-static bool validTemp(float t) {
-  return isfinite(t) && t >= TEMP_MIN_VALID_C && t <= TEMP_MAX_VALID_C;
+// ================= HELPERS =================
+
+bool maintenanceMode() {
+  return digitalRead(MAINTENANCE_MODE_PIN) == LOW;
 }
 
-static float readDs18b20C(uint8_t index, bool &ok) {
-  float tempC = ds18b20.getTempCByIndex(index);
-
-  if (tempC == DEVICE_DISCONNECTED_C || !validTemp(tempC)) {
-    ok = false;
-    return NAN;
-  }
-
-  ok = true;
-  return tempC;
+bool validTemp(float t) {
+  // DS18B20 missing commonly returns -127C.
+  // 85C is the power-on/default conversion value and should not count as valid.
+  return isfinite(t) && t != DEVICE_DISCONNECTED_C && t != 85.0f && t > -55.0f && t < 125.0f;
 }
 
-static void updateSoc(unsigned long nowMs) {
+bool n2kAlive() {
+#if N2K_OPEN_ENABLED
+  return lastCAN != 0 && ((millis() - lastCAN) < N2K_ACTIVITY_TIMEOUT_MS);
+#else
+  return false;
+#endif
+}
+
+void handleN2k(const tN2kMsg &msg) {
+  (void)msg;
+  lastCAN = millis();
+}
+
+void updateSoc(unsigned long nowMs) {
   if (lastSocUpdateMs == 0) {
     lastSocUpdateMs = nowMs;
     return;
@@ -224,310 +231,243 @@ static void updateSoc(unsigned long nowMs) {
   float dtHours = (nowMs - lastSocUpdateMs) / 3600000.0f;
   lastSocUpdateMs = nowMs;
 
-  if (!state.inaOk || dtHours <= 0.0f) return;
+  if (!inaOk || dtHours <= 0.0f) return;
 
-  // Positive current charges the battery. Negative current discharges it.
-  state.remainingAh += state.batteryCurrentA * dtHours;
+  // Positive current charges, negative current discharges.
+  remainingAh += batteryCurrentA * dtHours;
 
-  if (state.remainingAh < 0.0f) state.remainingAh = 0.0f;
-  if (state.remainingAh > BATTERY_CAPACITY_AH) state.remainingAh = BATTERY_CAPACITY_AH;
+  if (remainingAh < 0.0f) remainingAh = 0.0f;
+  if (remainingAh > BATTERY_CAPACITY_AH) remainingAh = BATTERY_CAPACITY_AH;
 
-  state.socPercent = (state.remainingAh / BATTERY_CAPACITY_AH) * 100.0f;
-  if (state.socPercent < SOC_MIN_PERCENT) state.socPercent = SOC_MIN_PERCENT;
-  if (state.socPercent > SOC_MAX_PERCENT) state.socPercent = SOC_MAX_PERCENT;
+  socPercent = (remainingAh / BATTERY_CAPACITY_AH) * 100.0f;
 }
 
-static void readSensors() {
-  float busV = 0.0f;
-  float shuntMV = 0.0f;
-  float currentA = 0.0f;
+void readSensors() {
+  inaOk = ina.read(batteryVoltageV, shuntVoltageMV, batteryCurrentA);
 
-  state.inaOk = ina226.read(busV, shuntMV, currentA);
-  if (state.inaOk) {
-    state.batteryVoltageV = busV;
-    state.shuntVoltageMV = shuntMV;
-    state.batteryCurrentA = currentA;
-  } else {
-    state.batteryVoltageV = 0.0f;
-    state.shuntVoltageMV = 0.0f;
-    state.batteryCurrentA = 0.0f;
+  if (!inaOk) {
+    batteryVoltageV = 0.0f;
+    shuntVoltageMV = 0.0f;
+    batteryCurrentA = 0.0f;
   }
 
-  state.batteryTempC = readDs18b20C(DS18B20_BATT_INDEX, state.battTempOk);
-  state.thrustTempC = readDs18b20C(DS18B20_THRUST_INDEX, state.thrustTempOk);
+  battTempC = temps.getTempCByIndex(0);
+  thrTempC  = temps.getTempCByIndex(1);
 
-  // Start next DS18B20 conversion. With wait-for-conversion disabled, this returns
-  // immediately and the next read gets the completed result.
-  ds18b20.requestTemperatures();
+  battTempOk = validTemp(battTempC);
+  thrTempOk  = validTemp(thrTempC);
+
+  temps.requestTemperatures();
 
   updateSoc(millis());
 }
 
-// -----------------------------------------------------------------------------
-// Serial + N2K diagnostics
-// -----------------------------------------------------------------------------
-static void logDiagnosticSerial(uint16_t code, const char *text, bool active) {
-  Serial.print(F("DIAG "));
-  Serial.print(code);
-  Serial.print(active ? F(" ACTIVE: ") : F(" CLEAR: "));
-  Serial.println(text);
+// ================= SERIAL STATUS =================
+
+void printCheckLine(const char *name, bool ok) {
+  Serial.print("Checking ");
+  Serial.print(name);
+  Serial.print("... ");
+  Serial.println(ok ? "OK" : "ERROR / not present");
 }
 
-static bool canSendDiagnosticOverN2k() {
-#if SEND_DIAGNOSTIC_TEXT_PGN
-  return n2kAlive();
+void printSystemCheck() {
+  Serial.println();
+  Serial.println("=== Bow Battery Monitor System Check ===");
+
+  printCheckLine("INA226 shunt monitor", inaOk);
+  printCheckLine("battery DS18B20 temperature sensor", battTempOk);
+  printCheckLine("thruster DS18B20 temperature sensor", thrTempOk);
+
+#if N2K_OPEN_ENABLED
+  printCheckLine("NMEA2000 traffic", n2kAlive());
 #else
-  return false;
+  Serial.println("Checking NMEA2000 traffic... SKIPPED - N2K_OPEN_ENABLED=false");
 #endif
+
+  Serial.println("-----------------------------------------");
+
+  if (!inaOk || !battTempOk || !thrTempOk || !n2kAlive()) {
+    Serial.println("System check complete: unable to continue normal operation.");
+    Serial.println("Status LED will indicate fault/warning state.");
+  } else {
+    Serial.println("System check complete: OK.");
+  }
+
+  if (maintenanceMode()) {
+    Serial.println("Maintenance mode: ENABLED - verbose logging active.");
+  } else {
+    Serial.println("Maintenance mode: disabled.");
+  }
+
+  Serial.println("=========================================");
+  Serial.println();
 }
 
-// Diagnostic text helper.
-// Serial output is always sent. N2K proprietary diagnostic text is sent only when
-// incoming N2K/CAN traffic has recently been seen, so we do not pretend the bus is OK.
-static void sendDiagnosticText(uint16_t code, const char *text, bool active = true) {
-  logDiagnosticSerial(code, text, active);
+void printVerboseStatus() {
+  if (!maintenanceMode()) return;
 
-#if SEND_DIAGNOSTIC_TEXT_PGN
-  if (!canSendDiagnosticOverN2k()) return;
-
-  tN2kMsg msg;
-  msg.SetPGN(130900UL);        // Proprietary diagnostic text PGN for this node/project
-  msg.Priority = 6;
-  msg.AddByte(DIAG_SOURCE_INSTANCE);
-  msg.Add2ByteUInt(code);
-  msg.AddByte(active ? 1 : 0); // 1=active/problem, 0=clear/info
-  msg.AddStr(text, 32);
-  NMEA2000.SendMsg(msg);
-#endif
-}
-
-static void sendDiagnosticTransitions() {
-  bool currentN2kOk = n2kAlive();
-
-  if (currentN2kOk != prevN2kOk) {
-    sendDiagnosticText(1000, currentN2kOk ? "N2K traffic detected" : "No N2K traffic", !currentN2kOk);
-    prevN2kOk = currentN2kOk;
-  }
-
-  if (state.inaOk != prevInaOk) {
-    sendDiagnosticText(1001, state.inaOk ? "INA226 OK" : "INA226 missing/invalid", !state.inaOk);
-    prevInaOk = state.inaOk;
-  }
-
-  if (state.battTempOk != prevBattTempOk) {
-    sendDiagnosticText(1002, state.battTempOk ? "Battery temp OK" : "Battery DS18B20 missing", !state.battTempOk);
-    prevBattTempOk = state.battTempOk;
-  }
-
-  if (state.thrustTempOk != prevThrustTempOk) {
-    sendDiagnosticText(1003, state.thrustTempOk ? "Thruster temp OK" : "Thruster DS18B20 missing", !state.thrustTempOk);
-    prevThrustTempOk = state.thrustTempOk;
-  }
-}
-
-static void sendPeriodicDiagnosticSummary() {
-  if (!n2kAlive()) {
-    sendDiagnosticText(1000, "No N2K traffic", true);
-  }
-  if (!state.inaOk) {
-    sendDiagnosticText(1001, "INA226 missing/invalid", true);
-  }
-  if (!state.battTempOk) {
-    sendDiagnosticText(1002, "Battery DS18B20 missing", true);
-  }
-  if (!state.thrustTempOk) {
-    sendDiagnosticText(1003, "Thruster DS18B20 missing", true);
-  }
-}
-
-static void printVerboseValues() {
-#if SERIAL_VERBOSE
   unsigned long now = millis();
   if (now - lastVerbosePrintMs < VERBOSE_PRINT_INTERVAL_MS) return;
   lastVerbosePrintMs = now;
 
-  Serial.print(F("V=")); Serial.print(state.batteryVoltageV, 3);
-  Serial.print(F("V I=")); Serial.print(state.batteryCurrentA, 2);
-  Serial.print(F("A shunt=")); Serial.print(state.shuntVoltageMV, 4);
-  Serial.print(F("mV SOC=")); Serial.print(state.socPercent, 1);
-  Serial.print(F("% battT="));
-  if (state.battTempOk) Serial.print(state.batteryTempC, 1); else Serial.print(F("NA"));
-  Serial.print(F("C thrustT="));
-  if (state.thrustTempOk) Serial.print(state.thrustTempC, 1); else Serial.print(F("NA"));
-  Serial.print(F("C INA=")); Serial.print(state.inaOk ? F("OK") : F("BAD"));
-  Serial.print(F(" N2K=")); Serial.println(n2kAlive() ? F("OK") : F("BAD"));
-#endif
+  Serial.print("STATUS ");
+  Serial.print("INA=");
+  Serial.print(inaOk ? "OK" : "FAIL");
+
+  Serial.print(" N2K=");
+  Serial.print(n2kAlive() ? "OK" : "FAIL");
+
+  Serial.print(" V=");
+  Serial.print(batteryVoltageV, 3);
+
+  Serial.print(" I=");
+  Serial.print(batteryCurrentA, 2);
+
+  Serial.print(" shunt_mV=");
+  Serial.print(shuntVoltageMV, 4);
+
+  Serial.print(" SOC=");
+  Serial.print(socPercent, 1);
+  Serial.print("%");
+
+  Serial.print(" BattTemp=");
+  if (battTempOk) Serial.print(battTempC, 1);
+  else Serial.print("FAIL");
+
+  Serial.print(" ThrTemp=");
+  if (thrTempOk) Serial.print(thrTempC, 1);
+  else Serial.print("FAIL");
+
+  Serial.println();
 }
 
-// -----------------------------------------------------------------------------
-// NMEA2000 reporting
-// -----------------------------------------------------------------------------
-static void sendBatteryStatus() {
+// ================= N2K SEND =================
+
+void sendN2kValues() {
+#if N2K_OPEN_ENABLED
   tN2kMsg msg;
 
-  // PGN 127508 - Battery Status: voltage, current, temperature
-  double tempK = state.battTempOk ? (state.batteryTempC + 273.15) : N2kDoubleNA;
-  double voltage = state.inaOk ? state.batteryVoltageV : N2kDoubleNA;
-  double current = state.inaOk ? state.batteryCurrentA : N2kDoubleNA;
+  double tempK = battTempOk ? (battTempC + 273.15) : N2kDoubleNA;
+  double voltage = inaOk ? batteryVoltageV : N2kDoubleNA;
+  double current = inaOk ? batteryCurrentA : N2kDoubleNA;
 
   SetN2kDCBatStatus(
     msg,
-    N2K_BATTERY_INSTANCE,
+    0,        // battery instance
     voltage,
     current,
     tempK
   );
   NMEA2000.SendMsg(msg);
-}
 
-static void sendTemperatures() {
-  tN2kMsg msg;
-
-  // PGN 130312 / 130316 depending on library version implementation.
-  // Battery temp. NMEA2000 library has no BatteryTemperature enum,
-  // so use EngineRoomTemperature and distinguish by instance.
-  // Instance N2K_BATT_TEMP_INSTANCE = battery temperature.
+  // Battery temp as generic engine-room temp, instance 0
   SetN2kTemperature(
     msg,
     0,
-    N2K_BATT_TEMP_INSTANCE,
+    0,
     N2kts_EngineRoomTemperature,
-    state.battTempOk ? (state.batteryTempC + 273.15) : N2kDoubleNA,
+    battTempOk ? (battTempC + 273.15) : N2kDoubleNA,
     N2kDoubleNA
   );
   NMEA2000.SendMsg(msg);
 
-  // Thruster motor area temp. Engine room is not semantically perfect, but widely understood.
+  // Thruster temp as generic engine-room temp, instance 1
   SetN2kTemperature(
     msg,
     0,
-    N2K_THRUST_TEMP_INSTANCE,
+    1,
     N2kts_EngineRoomTemperature,
-    state.thrustTempOk ? (state.thrustTempC + 273.15) : N2kDoubleNA,
+    thrTempOk ? (thrTempC + 273.15) : N2kDoubleNA,
     N2kDoubleNA
   );
   NMEA2000.SendMsg(msg);
+#endif
 }
 
-static void sendSocStatus() {
-  // Some versions of the NMEA2000 library include SetN2kDCStatus and some do not.
-  // If your installed library supports it, uncomment this block.
-  //
-  // tN2kMsg msg;
-  // SetN2kDCStatus(
-  //   msg,
-  //   0,                         // SID
-  //   N2K_BATTERY_INSTANCE,
-  //   N2kDCt_Battery,
-  //   state.socPercent,           // State of Charge %
-  //   N2kUInt8NA,                 // State of Health % unknown
-  //   N2kDoubleNA,                // Time remaining
-  //   N2kDoubleNA,                // Ripple voltage
-  //   BATTERY_CAPACITY_AH         // Capacity Ah
-  // );
-  // NMEA2000.SendMsg(msg);
+// ================= SETUP / LOOP =================
 
-  // Fallback: SOC is kept internally even if not sent by this library build.
-}
-
-static void sendAllN2kValues() {
-  sendBatteryStatus();
-  sendTemperatures();
-  sendSocStatus();
-}
-
-// Any incoming NMEA2000 message proves the CAN/N2K physical/logical path is alive.
-static void handleN2kMessage(const tN2kMsg &msg) {
-  (void)msg;
-  lastN2kRxMs = millis();
-}
-
-// -----------------------------------------------------------------------------
-// Setup / loop
-// -----------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(100);
 
   bootMs = millis();
 
-  statusPixel.begin();
-  statusPixel.setBrightness(STATUS_LED_BRIGHTNESS);
-  statusPixel.clear();
-  statusPixel.show();
-  bootLedSequence();
+  pinMode(MAINTENANCE_MODE_PIN, INPUT_PULLUP);
 
-  Serial.println(F("Bow Battery Monitor boot"));
+  led.begin();
+  led.setBrightness(STATUS_LED_BRIGHTNESS);
+  led.clear();
+  led.show();
+
+  bootSequence();
+
+  Serial.println("Bow Battery Monitor boot");
 
   Wire.begin();
-  state.inaOk = ina226.begin();
+  Serial.println("Checking I2C bus... OK");
 
-  ds18b20.begin();
-  ds18b20.setResolution(DS18B20_RESOLUTION_BITS);
-  ds18b20.setWaitForConversion(false);
-  ds18b20.requestTemperatures();
-  delay(DS18B20_FIRST_CONVERSION_DELAY_MS);
+  Serial.print("Checking INA226 shunt monitor... ");
+  inaOk = ina.begin();
+  Serial.println(inaOk ? "OK" : "ERROR / not present");
 
-  // NMEA2000 setup
-  NMEA2000.SetProductInformation(
-    DEVICE_SERIAL,
-    N2K_PRODUCT_CODE,
-    DEVICE_NAME,
-    DEVICE_SOFTWARE_VERSION,
-    DEVICE_MODEL_VERSION,
-    N2K_LOAD_EQ,
-    2001
-  );
+  Serial.print("Checking DS18B20 bus... ");
+  temps.begin();
+  temps.setWaitForConversion(false);
+  temps.requestTemperatures();
+  delay(750);
+  Serial.println("OK");
 
-  NMEA2000.SetDeviceInformation(
-    N2K_DEVICE_UNIQUE_NUMBER,
-    140,                       // Device Function: Sensor / monitor-ish. Adjust if desired.
-    75,                        // Device Class: Electrical generation / electrical system-ish
-    N2K_MANUFACTURER_CODE
-  );
-
-  NMEA2000.SetMsgHandler(handleN2kMessage);
+#if N2K_OPEN_ENABLED
+  Serial.println("Opening NMEA2000...");
+  NMEA2000.SetMsgHandler(handleN2k);
   NMEA2000.Open();
+  Serial.println("NMEA2000 open returned");
+#else
+  Serial.println("NMEA2000 open skipped for bench testing");
+#endif
 
-  // Prime readings and diagnostics.
+  n2kGraceStartMs = millis();
+
   readSensors();
-  prevInaOk = state.inaOk;
-  prevBattTempOk = state.battTempOk;
-  prevThrustTempOk = state.thrustTempOk;
-  prevN2kOk = n2kAlive();
+  printSystemCheck();
 
-  sendDiagnosticText(9000, "Bow battery monitor boot", false);
+  initialCheckPrinted = true;
 
-  if (!state.inaOk) sendDiagnosticText(1001, "INA226 missing/invalid", true);
-  if (!state.battTempOk) sendDiagnosticText(1002, "Battery DS18B20 missing", true);
-  if (!state.thrustTempOk) sendDiagnosticText(1003, "Thruster DS18B20 missing", true);
+  if (!inaOk || !battTempOk || !thrTempOk || !n2kAlive()) {
+    sysState = SYS_FAILED;
+  } else {
+    sysState = SYS_RUNNING;
+  }
 }
 
 void loop() {
   unsigned long now = millis();
 
+#if N2K_OPEN_ENABLED
   NMEA2000.ParseMessages();
+#endif
 
   if (now - lastSensorReadMs >= SENSOR_READ_INTERVAL_MS) {
     lastSensorReadMs = now;
     readSensors();
-    sendDiagnosticTransitions();
+
+    // If something recovers later, allow transition into running.
+    if (inaOk && battTempOk && thrTempOk && n2kAlive()) {
+      sysState = SYS_RUNNING;
+    } else {
+      sysState = SYS_FAILED;
+    }
   }
 
-  if (now - lastN2kSendMs >= N2K_SEND_INTERVAL_MS) {
+  updateLED();
+  printVerboseStatus();
+
+#if N2K_OPEN_ENABLED
+  static unsigned long lastN2kSendMs = 0;
+  if (now - lastN2kSendMs >= 1000) {
     lastN2kSendMs = now;
-    sendAllN2kValues();
+    sendN2kValues();
   }
-
-  if (now - lastDiagSendMs >= DIAG_SEND_INTERVAL_MS) {
-    lastDiagSendMs = now;
-    sendPeriodicDiagnosticSummary();
-  }
-
-  if (now - lastLedUpdateMs >= LED_UPDATE_INTERVAL_MS) {
-    lastLedUpdateMs = now;
-    updateStatusLed();
-  }
-
-  printVerboseValues();
+#endif
 }
